@@ -24,9 +24,9 @@ import (
 type probeResult int
 
 const (
-	probeH2         probeResult = iota // upstream supports HTTP/2
-	probeH1Only                        // upstream is reachable but only supports HTTP/1.1
-	probeUnreachable                   // upstream is unreachable (dial or TLS failure)
+	probeH2          probeResult = iota // upstream supports HTTP/2
+	probeH1Only                         // upstream is reachable but only supports HTTP/1.1
+	probeUnreachable                    // upstream is unreachable (dial or TLS failure)
 )
 
 // dialUpstreamTLS dials the upstream host and performs a TLS handshake.
@@ -159,18 +159,20 @@ func stripPort(s string) string {
 }
 
 func (proxy *ProxyHttpServer) dial(ctx *ProxyCtx, network, addr string) (c net.Conn, err error) {
+	dialCtx := ctx.Req.Context()
+
 	if ctx.Dialer != nil {
-		return ctx.Dialer(ctx.Req.Context(), network, addr)
+		return ctx.Dialer(dialCtx, network, addr)
 	}
 
 	if proxy.Tr != nil && proxy.Tr.DialContext != nil {
-		return proxy.Tr.DialContext(ctx.Req.Context(), network, addr)
+		return proxy.Tr.DialContext(dialCtx, network, addr)
 	}
 
 	// if the user didn't specify any dialer, we just use the default one,
 	// provided by net package
 	var d net.Dialer
-	return d.DialContext(ctx.Req.Context(), network, addr)
+	return d.DialContext(dialCtx, network, addr)
 }
 
 func (proxy *ProxyHttpServer) connectDial(ctx *ProxyCtx, network, addr string) (c net.Conn, err error) {
@@ -288,6 +290,12 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 		// request can take forever, and the server will be stuck when "closed".
 		// TODO: Allow Server.Close() mechanism to shut down this connection as nicely as possible
 		go func() {
+			// sessionCtx tracks the client-to-proxy connection lifetime.
+			// It inherits trace values from the original request but is
+			// detached from its cancellation (r.Context() is cancelled
+			// when handleHttps returns). Cancelled when client closes.
+			sessionCtx, sessionCancel := context.WithCancel(context.WithoutCancel(r.Context()))
+
 			// Check if this is an HTTP or an HTTPS MITM request
 			readBuffer := bufio.NewReader(proxyClient)
 			peek, _ := readBuffer.Peek(1)
@@ -296,6 +304,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			var client net.Conn = &readBufferedConn{Conn: proxyClient, r: readBuffer}
 			defer func() {
 				_ = client.Close()
+				sessionCancel()
 			}()
 
 			// upstreamRT is set when MatchUpstreamH2 pre-dials the upstream
@@ -332,7 +341,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						// Dial the upstream and perform TLS handshake to
 						// discover the negotiated protocol. The connection
 						// is kept open and reused for proxied requests.
-						upstreamConn, result := dialUpstreamTLS(ctx.Req.Context(), host, proxy.Tr)
+						upstreamConn, result := dialUpstreamTLS(sessionCtx, host, proxy.Tr)
 						switch result {
 						case probeH1Only:
 							offerH2 = false
@@ -387,7 +396,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				// Create a TLS connection over the TCP connection
 				rawClientTls := tls.Server(client, tlsConfig)
 				client = rawClientTls
-				if err := rawClientTls.HandshakeContext(context.Background()); err != nil {
+				if err := rawClientTls.HandshakeContext(sessionCtx); err != nil {
 					ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
 					return
 				}
