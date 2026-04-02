@@ -15,11 +15,45 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"time"
+
 	"golang.org/x/net/http2"
 
 	"github.com/elazarl/goproxy/internal/http1parser"
 	"github.com/elazarl/goproxy/internal/signer"
 )
+
+// probeUpstreamH2 dials the upstream host and performs a TLS handshake to
+// check if the server supports HTTP/2 via ALPN. Returns true if h2 was
+// negotiated. Returns false if the server only supports HTTP/1.1 or if
+// the connection fails (for fast failure on unreachable hosts).
+func probeUpstreamH2(host string, proxyTr *http.Transport) bool {
+	addr := host
+	if !strings.Contains(addr, ":") {
+		addr += ":443"
+	}
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	probeCfg := &tls.Config{
+		ServerName:         stripPort(host),
+		NextProtos:         []string{http2.NextProtoTLS, "http/1.1"},
+		InsecureSkipVerify: true,
+	}
+	if proxyTr != nil && proxyTr.TLSClientConfig != nil {
+		probeCfg.InsecureSkipVerify = proxyTr.TLSClientConfig.InsecureSkipVerify
+	}
+
+	tlsConn := tls.Client(conn, probeCfg)
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		return false
+	}
+	_ = tlsConn.Close()
+	return tlsConn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS
+}
 
 type ConnectActionLiteral int
 
@@ -240,11 +274,25 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					}
 				}
 
-					// When HTTP/2 is allowed, advertise it via ALPN so the client
+				// When HTTP/2 is allowed, advertise it via ALPN so the client
 				// can negotiate h2 during the TLS handshake.
 				if proxy.AllowHTTP2 {
+					offerH2 := true
+					if proxy.MatchUpstreamH2 {
+						// Probe the upstream to decide whether to offer h2.
+						// If the upstream doesn't support h2 or is unreachable,
+						// only offer HTTP/1.1 to the client.
+						offerH2 = probeUpstreamH2(host, proxy.Tr)
+						if !offerH2 {
+							ctx.Logf("upstream %s does not support h2, offering http/1.1 only", host)
+						}
+					}
 					tlsConfig = tlsConfig.Clone()
-					tlsConfig.NextProtos = append(tlsConfig.NextProtos, http2.NextProtoTLS, "http/1.1")
+					if offerH2 {
+						tlsConfig.NextProtos = append(tlsConfig.NextProtos, http2.NextProtoTLS, "http/1.1")
+					} else {
+						tlsConfig.NextProtos = append(tlsConfig.NextProtos, "http/1.1")
+					}
 				}
 
 				// Create a TLS connection over the TCP connection

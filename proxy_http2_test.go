@@ -460,3 +460,128 @@ func TestMITMClientH2ToHTTP1Backend(t *testing.T) {
 	assert.Equal(t, "http1 backend", string(body))
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
+
+// TestMatchUpstreamH2_UpstreamH2 verifies that when MatchUpstreamH2 is
+// enabled and the upstream supports HTTP/2, the client gets HTTP/2.
+func TestMatchUpstreamH2_UpstreamH2(t *testing.T) {
+	// HTTP/2 upstream server.
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("h2 ok"))
+	}))
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	defer srv.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.AllowHTTP2 = true
+	proxy.MatchUpstreamH2 = true
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	proxyURL, _ := url.Parse(proxySrv.URL)
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(proxyURL),
+			ForceAttemptHTTP2: true,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				NextProtos:         []string{"h2", "http/1.1"},
+			},
+		},
+	}
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "h2 ok", string(body))
+	assert.Equal(t, 2, resp.ProtoMajor,
+		"client should negotiate h2 when upstream supports it, got %s", resp.Proto)
+}
+
+// TestMatchUpstreamH2_UpstreamH1Only verifies that when MatchUpstreamH2 is
+// enabled and the upstream only supports HTTP/1.1, the client is downgraded
+// to HTTP/1.1 (the proxy does not offer h2).
+func TestMatchUpstreamH2_UpstreamH1Only(t *testing.T) {
+	// HTTP/1.1-only TLS server.
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("h1 ok"))
+	}))
+	srv.TLS = &tls.Config{NextProtos: []string{"http/1.1"}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.AllowHTTP2 = true
+	proxy.MatchUpstreamH2 = true
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	proxyURL, _ := url.Parse(proxySrv.URL)
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(proxyURL),
+			ForceAttemptHTTP2: true,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				NextProtos:         []string{"h2", "http/1.1"},
+			},
+		},
+	}
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "h1 ok", string(body))
+	assert.Equal(t, 1, resp.ProtoMajor,
+		"client should get h1.1 when upstream only supports h1.1, got %s", resp.Proto)
+}
+
+// TestMatchUpstreamH2_UnreachableHost verifies that when MatchUpstreamH2 is
+// enabled and the upstream is unreachable, the proxy defaults to HTTP/1.1
+// for fast failure (no h2 offered to the client).
+func TestMatchUpstreamH2_UnreachableHost(t *testing.T) {
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.AllowHTTP2 = true
+	proxy.MatchUpstreamH2 = true
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	proxyURL, _ := url.Parse(proxySrv.URL)
+
+	// Connect to the proxy and send CONNECT for an unreachable host.
+	conn, err := net.Dial("tcp", proxyURL.Host)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	connectReq, _ := http.NewRequestWithContext(context.Background(),
+		http.MethodConnect, "http://127.0.0.1:19999", nil)
+	connectReq.Host = "127.0.0.1:19999"
+	require.NoError(t, connectReq.Write(conn))
+	br := bufio.NewReader(conn)
+	connectResp, err := http.ReadResponse(br, connectReq)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, connectResp.StatusCode)
+
+	// Do TLS handshake offering both h2 and http/1.1.
+	tlsConn := tls.Client(&h2ReadBufferedConn{Conn: conn, r: br}, &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2", "http/1.1"},
+	})
+	require.NoError(t, tlsConn.HandshakeContext(context.Background()))
+
+	// The proxy should NOT have offered h2 (unreachable upstream).
+	assert.NotEqual(t, "h2", tlsConn.ConnectionState().NegotiatedProtocol,
+		"proxy should not offer h2 for unreachable upstream")
+}

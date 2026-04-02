@@ -35,8 +35,18 @@ type ProxyHttpServer struct {
 	ConnectDial        func(network string, addr string) (net.Conn, error)
 	ConnectDialWithReq func(req *http.Request, network string, addr string) (net.Conn, error)
 	CertStore          CertStorage
-	KeepHeader         bool
-	AllowHTTP2         bool
+	KeepHeader bool
+	AllowHTTP2 bool
+	// MatchUpstreamH2 controls whether the proxy probes the upstream
+	// server's HTTP/2 support before the MITM TLS handshake with the
+	// client. When true (and AllowHTTP2 is also true), the proxy
+	// connects to the upstream during the CONNECT phase to check ALPN.
+	// If the upstream supports h2, the proxy offers h2 to the client;
+	// otherwise it offers only HTTP/1.1. If the upstream is unreachable,
+	// the proxy defaults to HTTP/1.1 for fast failure.
+	// When false (default), the proxy always offers h2 to the client
+	// if AllowHTTP2 is set, regardless of upstream support.
+	MatchUpstreamH2 bool
 	// When PreventCanonicalization is true, the header names present in
 	// the request sent through the proxy are directly passed to the destination server,
 	// instead of following the HTTP RFC for their canonicalization.

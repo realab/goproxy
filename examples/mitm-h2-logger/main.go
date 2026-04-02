@@ -38,6 +38,7 @@ func main() {
 	// Enable HTTP/2 frame-level proxying so that clients negotiating h2
 	// via ALPN are handled correctly.
 	proxy.AllowHTTP2 = true
+	proxy.MatchUpstreamH2 = true
 
 	// Configure the outbound transport to speak HTTP/2 to upstream servers.
 	proxy.Tr = &http.Transport{
