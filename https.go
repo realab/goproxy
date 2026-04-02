@@ -15,8 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"time"
-
 	"golang.org/x/net/http2"
 
 	"github.com/elazarl/goproxy/internal/http1parser"
@@ -35,16 +33,28 @@ const (
 // On success it returns the established TLS connection (kept open) and the
 // probe result. The caller is responsible for closing the returned connection.
 // On failure it returns (nil, probeUnreachable).
-func dialUpstreamTLS(host string, proxyTr *http.Transport) (net.Conn, probeResult) {
+func dialUpstreamTLS(dialCtx context.Context, host string, proxyTr *http.Transport) (net.Conn, probeResult) {
 	addr := host
 	if !strings.Contains(addr, ":") {
 		addr += ":443"
 	}
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+
+	var d net.Dialer
+	if proxyTr != nil && proxyTr.DialContext != nil {
+		conn, err := proxyTr.DialContext(dialCtx, "tcp", addr)
+		if err != nil {
+			return nil, probeUnreachable
+		}
+		return doTLSHandshake(dialCtx, conn, host, proxyTr)
+	}
+	conn, err := d.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		return nil, probeUnreachable
 	}
+	return doTLSHandshake(dialCtx, conn, host, proxyTr)
+}
 
+func doTLSHandshake(dialCtx context.Context, conn net.Conn, host string, proxyTr *http.Transport) (net.Conn, probeResult) {
 	tlsCfg := &tls.Config{
 		ServerName:         stripPort(host),
 		NextProtos:         []string{http2.NextProtoTLS, "http/1.1"},
@@ -55,7 +65,7 @@ func dialUpstreamTLS(host string, proxyTr *http.Transport) (net.Conn, probeResul
 	}
 
 	tlsConn := tls.Client(conn, tlsCfg)
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
 		conn.Close()
 		return nil, probeUnreachable
 	}
@@ -322,7 +332,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						// Dial the upstream and perform TLS handshake to
 						// discover the negotiated protocol. The connection
 						// is kept open and reused for proxied requests.
-						upstreamConn, result := dialUpstreamTLS(host, proxy.Tr)
+						upstreamConn, result := dialUpstreamTLS(ctx.Req.Context(), host, proxy.Tr)
 						switch result {
 						case probeH1Only:
 							offerH2 = false
@@ -331,14 +341,14 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							// cloned transport with a one-shot DialTLSContext.
 							tr := proxy.Tr.Clone()
 							var connUsed sync.Once
-							tr.DialTLSContext = func(_ context.Context, _, _ string) (net.Conn, error) {
+							tr.DialTLSContext = func(tlsCtx context.Context, _, _ string) (net.Conn, error) {
 								var c net.Conn
 								connUsed.Do(func() { c = upstreamConn })
 								if c != nil {
 									return c, nil
 								}
 								dialer := tls.Dialer{Config: tr.TLSClientConfig}
-								return dialer.DialContext(context.Background(), "tcp", host)
+								return dialer.DialContext(tlsCtx, "tcp", host)
 							}
 							upstreamRT = &closableRoundTripper{
 								rt: func(req *http.Request, _ *ProxyCtx) (*http.Response, error) {
