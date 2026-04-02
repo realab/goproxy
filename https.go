@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"golang.org/x/net/http2"
+
 	"github.com/elazarl/goproxy/internal/http1parser"
 	"github.com/elazarl/goproxy/internal/signer"
 )
@@ -238,11 +240,36 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					}
 				}
 
+					// When HTTP/2 is allowed, advertise it via ALPN so the client
+				// can negotiate h2 during the TLS handshake.
+				if proxy.AllowHTTP2 {
+					tlsConfig = tlsConfig.Clone()
+					tlsConfig.NextProtos = append(tlsConfig.NextProtos, http2.NextProtoTLS, "http/1.1")
+				}
+
 				// Create a TLS connection over the TCP connection
 				rawClientTls := tls.Server(client, tlsConfig)
 				client = rawClientTls
 				if err := rawClientTls.HandshakeContext(context.Background()); err != nil {
 					ctx.Warnf("Cannot handshake client %v %v", r.Host, err)
+					return
+				}
+
+				// If HTTP/2 was negotiated via ALPN, proxy at the frame level.
+				if rawClientTls.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS {
+					// Consume the HTTP/2 client connection preface before
+					// handing off to the frame-level transport.
+					preface := make([]byte, len(http2.ClientPreface))
+					if _, err := io.ReadFull(rawClientTls, preface); err != nil {
+						ctx.Warnf("Failed to read HTTP2 client preface: %v", err)
+						return
+					}
+					tr := H2Transport{rawClientTls, rawClientTls, tlsConfig, host}
+					if _, err := tr.RoundTrip(nil); err != nil {
+						ctx.Warnf("HTTP2 connection failed: %v", err)
+					} else {
+						ctx.Logf("Exiting on EOF")
+					}
 					return
 				}
 			}

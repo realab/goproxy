@@ -28,39 +28,23 @@ type H2Transport struct {
 // RoundTrip executes an HTTP/2 session (including all contained streams).
 // The request and response are ignored but any error encountered during the
 // proxying from the session is returned as a result of the invocation.
+//
+// When TLSConfig is non-nil the upstream connection uses TLS (h2).
+// When TLSConfig is nil the upstream connection is plaintext (h2c).
 func (r *H2Transport) RoundTrip(_ *http.Request) (*http.Response, error) {
-	raddr := r.Host
-	if !strings.Contains(raddr, ":") {
-		raddr += ":443"
-	}
-	rawServerTLS, err := dial("tcp", raddr)
+	serverConn, err := r.dialServer()
 	if err != nil {
 		return nil, err
 	}
-	defer rawServerTLS.Close()
-	// Ensure that we only advertise HTTP/2 as the accepted protocol.
-	r.TLSConfig.NextProtos = []string{http2.NextProtoTLS}
-	// Initiate TLS and check remote host name against certificate.
-	rawServerTLS = tls.Client(rawServerTLS, r.TLSConfig)
-	rawTLSConn, ok := rawServerTLS.(*tls.Conn)
-	if !ok {
-		return nil, errors.New("invalid TLS connection")
-	}
-	if err = rawTLSConn.HandshakeContext(context.Background()); err != nil {
-		return nil, err
-	}
-	if r.TLSConfig == nil || !r.TLSConfig.InsecureSkipVerify {
-		if err = rawTLSConn.VerifyHostname(raddr[:strings.LastIndex(raddr, ":")]); err != nil {
-			return nil, err
-		}
-	}
+	defer serverConn.Close()
+
 	// Send new client preface to match the one parsed in req.
-	if _, err := io.WriteString(rawServerTLS, http2.ClientPreface); err != nil {
+	if _, err := io.WriteString(serverConn, http2.ClientPreface); err != nil {
 		return nil, err
 	}
-	serverTLSReader := bufio.NewReader(rawServerTLS)
-	cToS := http2.NewFramer(rawServerTLS, r.ClientReader)
-	sToC := http2.NewFramer(r.ClientWriter, serverTLSReader)
+	serverReader := bufio.NewReader(serverConn)
+	cToS := http2.NewFramer(serverConn, r.ClientReader)
+	sToC := http2.NewFramer(r.ClientWriter, serverReader)
 	errSToC := make(chan error)
 	errCToS := make(chan error)
 	go func() {
@@ -92,6 +76,45 @@ func (r *H2Transport) RoundTrip(_ *http.Request) (*http.Response, error) {
 		}
 	}
 	return nil, nil
+}
+
+// dialServer establishes a connection to the upstream server.
+// If TLSConfig is set, it performs a TLS handshake (h2 over TLS).
+// Otherwise it returns a plain TCP connection (h2c).
+func (r *H2Transport) dialServer() (net.Conn, error) {
+	raddr := r.Host
+	if !strings.Contains(raddr, ":") {
+		if r.TLSConfig != nil {
+			raddr += ":443"
+		} else {
+			raddr += ":80"
+		}
+	}
+	rawConn, err := dial("tcp", raddr)
+	if err != nil {
+		return nil, err
+	}
+
+	if r.TLSConfig == nil {
+		// h2c: plain TCP
+		return rawConn, nil
+	}
+
+	// h2 over TLS
+	tlsCfg := r.TLSConfig.Clone()
+	tlsCfg.NextProtos = []string{http2.NextProtoTLS}
+	tlsConn := tls.Client(rawConn, tlsCfg)
+	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+		rawConn.Close()
+		return nil, err
+	}
+	if !tlsCfg.InsecureSkipVerify {
+		if err := tlsConn.VerifyHostname(raddr[:strings.LastIndex(raddr, ":")]); err != nil {
+			tlsConn.Close()
+			return nil, err
+		}
+	}
+	return tlsConn, nil
 }
 
 func dial(network, addr string) (c net.Conn, err error) {
