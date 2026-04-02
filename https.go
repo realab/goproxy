@@ -255,21 +255,60 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					return
 				}
 
-				// If HTTP/2 was negotiated via ALPN, proxy at the frame level.
+				// If HTTP/2 was negotiated via ALPN, serve each HTTP/2
+				// stream as a regular request through the proxy handler
+				// chain. This allows the proxy's transport to negotiate
+				// the upstream protocol independently (h2 or h1.1).
 				if rawClientTls.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS {
-					// Consume the HTTP/2 client connection preface before
-					// handing off to the frame-level transport.
-					preface := make([]byte, len(http2.ClientPreface))
-					if _, err := io.ReadFull(rawClientTls, preface); err != nil {
-						ctx.Warnf("Failed to read HTTP2 client preface: %v", err)
-						return
-					}
-					tr := H2Transport{rawClientTls, rawClientTls, tlsConfig, host}
-					if _, err := tr.RoundTrip(nil); err != nil {
-						ctx.Warnf("HTTP2 connection failed: %v", err)
-					} else {
-						ctx.Logf("Exiting on EOF")
-					}
+					h2Server := &http2.Server{}
+					h2Server.ServeConn(rawClientTls, &http2.ServeConnOpts{
+						Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+							if !strings.HasPrefix(req.URL.String(), "https://") {
+								req.URL, _ = url.Parse("https://" + r.Host + req.URL.String())
+							}
+							req.RemoteAddr = r.RemoteAddr
+							ctx := &ProxyCtx{
+								Req:          req,
+								Session:      atomic.AddInt64(&proxy.sess, 1),
+								Proxy:        proxy,
+								UserData:     ctx.UserData,
+								RoundTripper: ctx.RoundTripper,
+							}
+							req, resp := proxy.filterRequest(req, ctx)
+							if resp == nil {
+								if !proxy.KeepHeader {
+									RemoveProxyHeaders(ctx, req)
+								}
+								var err error
+								resp, err = ctx.RoundTrip(req)
+								if err != nil {
+									ctx.Warnf("Cannot read response from mitm'd server %v", err)
+									http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
+									return
+								}
+								ctx.Logf("resp %v", resp.Status)
+							}
+							resp = proxy.filterResponse(resp, ctx)
+							defer resp.Body.Close()
+
+							copyHeaders(w.Header(), resp.Header, proxy.KeepDestinationHeaders)
+
+							w.WriteHeader(resp.StatusCode)
+
+							// Use a flushing writer so streaming protocols
+							// (gRPC, SSE) deliver data to the client promptly.
+							_, _ = io.Copy(&flushWriter{w: w}, resp.Body)
+
+							// Copy trailers after the body is fully read.
+							// Use http.TrailerPrefix so the HTTP/2 server
+							// sends them as proper HTTP/2 trailer frames.
+							for k, vs := range resp.Trailer {
+								for _, v := range vs {
+									w.Header().Add(http.TrailerPrefix+k, v)
+								}
+							}
+						}),
+					})
 					return
 				}
 			}

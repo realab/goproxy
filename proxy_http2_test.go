@@ -301,6 +301,12 @@ func TestMITMGRPCBidirectionalStream(t *testing.T) {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 	proxy.AllowHTTP2 = true
+	// Enable HTTP/2 on the upstream transport so the proxy can speak h2
+	// to the gRPC server.
+	proxy.Tr = &http.Transport{
+		ForceAttemptHTTP2: true,
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
+	}
 	proxySrv := httptest.NewServer(proxy)
 	defer proxySrv.Close()
 	proxyURL, _ := url.Parse(proxySrv.URL)
@@ -409,4 +415,48 @@ func TestMITMH2CGRPCBidirectionalStream(t *testing.T) {
 	var trailing wrapperspb.StringValue
 	err = stream.RecvMsg(&trailing)
 	assert.ErrorIs(t, err, io.EOF, "stream should end after CloseSend")
+}
+
+// TestMITMClientH2ToHTTP1Backend verifies that an HTTP/2 client can
+// successfully reach an HTTP/1.1-only HTTPS backend through the MITM proxy.
+func TestMITMClientH2ToHTTP1Backend(t *testing.T) {
+	// HTTP/1.1-only TLS server (HTTP/2 explicitly disabled).
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte("http1 backend"))
+	}))
+	srv.TLS = &tls.Config{NextProtos: []string{"http/1.1"}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	// Proxy with MITM and HTTP/2 enabled.
+	proxy := goproxy.NewProxyHttpServer()
+	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+	proxy.AllowHTTP2 = true
+
+	proxySrv := httptest.NewServer(proxy)
+	defer proxySrv.Close()
+
+	// Client negotiates HTTP/2 with the proxy.
+	proxyURL, _ := url.Parse(proxySrv.URL)
+	client := &http.Client{
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(proxyURL),
+			ForceAttemptHTTP2: true,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				NextProtos:         []string{"h2", "http/1.1"},
+			},
+		},
+	}
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, nil)
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "http1 backend", string(body))
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
