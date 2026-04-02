@@ -529,7 +529,8 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						resp, err = ctx.RoundTrip(req)
 						if err != nil {
 							ctx.Warnf("Cannot read response from mitm'd server %v", err)
-							return false
+							resp = NewResponse(req, ContentTypeText, http.StatusBadGateway,
+								"Bad Gateway: "+err.Error())
 						}
 						ctx.Logf("resp %v", resp.Status)
 					}

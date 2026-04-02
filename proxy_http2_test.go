@@ -392,6 +392,54 @@ func TestMITMClientHTTP2Negotiation(t *testing.T) {
 		assert.Equal(t, "h2", tlsConn.ConnectionState().NegotiatedProtocol,
 			"proxy should offer h2 for unreachable upstream to deliver error in best protocol")
 	})
+
+	t.Run("MatchUpstreamH2/UnreachableHost/H1Client", func(t *testing.T) {
+		// Verify that an HTTP/1.1-only client gets a proper 502 error
+		// response (not an empty reply) when the upstream is unreachable.
+		proxy := goproxy.NewProxyHttpServer()
+		proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
+		proxy.AllowHTTP2 = true
+		proxy.MatchUpstreamH2 = true
+
+		proxySrv := httptest.NewServer(proxy)
+		defer proxySrv.Close()
+
+		proxyURL, _ := url.Parse(proxySrv.URL)
+
+		conn, err := net.Dial("tcp", proxyURL.Host)
+		require.NoError(t, err)
+		defer conn.Close()
+
+		connectReq, _ := http.NewRequestWithContext(context.Background(),
+			http.MethodConnect, "http://127.0.0.1:19999", nil)
+		connectReq.Host = "127.0.0.1:19999"
+		require.NoError(t, connectReq.Write(conn))
+		br := bufio.NewReader(conn)
+		connectResp, err := http.ReadResponse(br, connectReq)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, connectResp.StatusCode)
+
+		// HTTP/1.1-only client (no h2 in ALPN).
+		tlsConn := tls.Client(&h2ReadBufferedConn{Conn: conn, r: br}, &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"http/1.1"},
+		})
+		require.NoError(t, tlsConn.HandshakeContext(context.Background()))
+		assert.Equal(t, "http/1.1", tlsConn.ConnectionState().NegotiatedProtocol)
+
+		// Send an HTTP/1.1 request through the tunnel.
+		httpReq, _ := http.NewRequestWithContext(context.Background(),
+			http.MethodGet, "https://127.0.0.1:19999/", nil)
+		require.NoError(t, httpReq.Write(tlsConn))
+
+		// Should get a 502 Bad Gateway, not an empty reply.
+		tlsBr := bufio.NewReader(tlsConn)
+		resp, err := http.ReadResponse(tlsBr, httpReq)
+		require.NoError(t, err, "expected a valid HTTP response, not an empty reply")
+		defer resp.Body.Close()
+
+		assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	})
 }
 
 // --- gRPC bidirectional streaming tests ---
