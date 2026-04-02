@@ -42,8 +42,10 @@ type ProxyHttpServer struct {
 	// client. When true (and AllowHTTP2 is also true), the proxy
 	// connects to the upstream during the CONNECT phase to check ALPN.
 	// If the upstream supports h2, the proxy offers h2 to the client;
-	// otherwise it offers only HTTP/1.1. If the upstream is unreachable,
-	// the proxy defaults to HTTP/1.1 for fast failure.
+	// if the upstream is reachable but only supports HTTP/1.1, the proxy
+	// offers only HTTP/1.1. If the upstream is unreachable, the proxy
+	// still offers h2 so the client can negotiate its preferred protocol
+	// for the error response.
 	// When false (default), the proxy always offers h2 to the client
 	// if AllowHTTP2 is set, regardless of upstream support.
 	MatchUpstreamH2 bool

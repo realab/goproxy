@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package echo;
+
+option go_package = "github.com/elazarl/goproxy/test_data/pb";
+
+service Echo {
+  rpc BidiChat(stream ChatMessage) returns (stream ChatMessage);
+}
+
+message ChatMessage {
+  string value = 1;
+}

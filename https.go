@@ -23,36 +23,46 @@ import (
 	"github.com/elazarl/goproxy/internal/signer"
 )
 
-// probeUpstreamH2 dials the upstream host and performs a TLS handshake to
-// check if the server supports HTTP/2 via ALPN. Returns true if h2 was
-// negotiated. Returns false if the server only supports HTTP/1.1 or if
-// the connection fails (for fast failure on unreachable hosts).
-func probeUpstreamH2(host string, proxyTr *http.Transport) bool {
+type probeResult int
+
+const (
+	probeH2         probeResult = iota // upstream supports HTTP/2
+	probeH1Only                        // upstream is reachable but only supports HTTP/1.1
+	probeUnreachable                   // upstream is unreachable (dial or TLS failure)
+)
+
+// dialUpstreamTLS dials the upstream host and performs a TLS handshake.
+// On success it returns the established TLS connection (kept open) and the
+// probe result. The caller is responsible for closing the returned connection.
+// On failure it returns (nil, probeUnreachable).
+func dialUpstreamTLS(host string, proxyTr *http.Transport) (net.Conn, probeResult) {
 	addr := host
 	if !strings.Contains(addr, ":") {
 		addr += ":443"
 	}
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
-		return false
+		return nil, probeUnreachable
 	}
-	defer conn.Close()
 
-	probeCfg := &tls.Config{
+	tlsCfg := &tls.Config{
 		ServerName:         stripPort(host),
 		NextProtos:         []string{http2.NextProtoTLS, "http/1.1"},
 		InsecureSkipVerify: true,
 	}
 	if proxyTr != nil && proxyTr.TLSClientConfig != nil {
-		probeCfg.InsecureSkipVerify = proxyTr.TLSClientConfig.InsecureSkipVerify
+		tlsCfg.InsecureSkipVerify = proxyTr.TLSClientConfig.InsecureSkipVerify
 	}
 
-	tlsConn := tls.Client(conn, probeCfg)
+	tlsConn := tls.Client(conn, tlsCfg)
 	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
-		return false
+		conn.Close()
+		return nil, probeUnreachable
 	}
-	_ = tlsConn.Close()
-	return tlsConn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS
+	if tlsConn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS {
+		return tlsConn, probeH2
+	}
+	return tlsConn, probeH1Only
 }
 
 type ConnectActionLiteral int
@@ -86,6 +96,24 @@ type readBufferedConn struct {
 
 func (c *readBufferedConn) Read(p []byte) (int, error) {
 	return c.r.Read(p)
+}
+
+// closableRoundTripper wraps a RoundTripperFunc with an optional Close method
+// for cleaning up resources (e.g. pre-dialed upstream connections).
+type closableRoundTripper struct {
+	rt    func(req *http.Request, ctx *ProxyCtx) (*http.Response, error)
+	close func()
+}
+
+func (c *closableRoundTripper) RoundTrip(req *http.Request, ctx *ProxyCtx) (*http.Response, error) {
+	return c.rt(req, ctx)
+}
+
+func (c *closableRoundTripper) Close() error {
+	if c.close != nil {
+		c.close()
+	}
+	return nil
 }
 
 // ConnectAction enables the caller to override the standard connect flow.
@@ -260,6 +288,18 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				_ = client.Close()
 			}()
 
+			// upstreamRT is set when MatchUpstreamH2 pre-dials the upstream
+			// connection. It reuses that connection for proxied requests so
+			// no second TCP dial is needed.
+			var upstreamRT RoundTripper
+			defer func() {
+				if upstreamRT != nil {
+					if c, ok := upstreamRT.(io.Closer); ok {
+						_ = c.Close()
+					}
+				}
+			}()
+
 			var tlsConfig *tls.Config
 			scheme := "http"
 			if isTLS {
@@ -279,12 +319,51 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				if proxy.AllowHTTP2 {
 					offerH2 := true
 					if proxy.MatchUpstreamH2 {
-						// Probe the upstream to decide whether to offer h2.
-						// If the upstream doesn't support h2 or is unreachable,
-						// only offer HTTP/1.1 to the client.
-						offerH2 = probeUpstreamH2(host, proxy.Tr)
-						if !offerH2 {
+						// Dial the upstream and perform TLS handshake to
+						// discover the negotiated protocol. The connection
+						// is kept open and reused for proxied requests.
+						upstreamConn, result := dialUpstreamTLS(host, proxy.Tr)
+						switch result {
+						case probeH1Only:
+							offerH2 = false
 							ctx.Logf("upstream %s does not support h2, offering http/1.1 only", host)
+							// Reuse the pre-dialed h1.1 connection via a
+							// cloned transport with a one-shot DialTLSContext.
+							tr := proxy.Tr.Clone()
+							var connUsed sync.Once
+							tr.DialTLSContext = func(_ context.Context, _, _ string) (net.Conn, error) {
+								var c net.Conn
+								connUsed.Do(func() { c = upstreamConn })
+								if c != nil {
+									return c, nil
+								}
+								dialer := tls.Dialer{Config: tr.TLSClientConfig}
+								return dialer.DialContext(context.Background(), "tcp", host)
+							}
+							upstreamRT = &closableRoundTripper{
+								rt: func(req *http.Request, _ *ProxyCtx) (*http.Response, error) {
+									return tr.RoundTrip(req)
+								},
+								close: tr.CloseIdleConnections,
+							}
+						case probeH2:
+							// Reuse the pre-dialed h2 connection via an
+							// http2.ClientConn created from it.
+							h2Tr := &http2.Transport{}
+							cc, err := h2Tr.NewClientConn(upstreamConn)
+							if err != nil {
+								_ = upstreamConn.Close()
+								ctx.Warnf("failed to create h2 client conn: %v", err)
+							} else {
+								upstreamRT = &closableRoundTripper{
+									rt: func(req *http.Request, _ *ProxyCtx) (*http.Response, error) {
+										return cc.RoundTrip(req)
+									},
+									close: func() { _ = cc.Close() },
+								}
+							}
+						case probeUnreachable:
+							ctx.Logf("upstream %s is unreachable, offering h2 for best error delivery", host)
 						}
 					}
 					tlsConfig = tlsConfig.Clone()
@@ -315,28 +394,31 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 								req.URL, _ = url.Parse("https://" + r.Host + req.URL.String())
 							}
 							req.RemoteAddr = r.RemoteAddr
-							ctx := &ProxyCtx{
+							sctx := &ProxyCtx{
 								Req:          req,
 								Session:      atomic.AddInt64(&proxy.sess, 1),
 								Proxy:        proxy,
 								UserData:     ctx.UserData,
 								RoundTripper: ctx.RoundTripper,
 							}
-							req, resp := proxy.filterRequest(req, ctx)
+							if sctx.RoundTripper == nil && upstreamRT != nil {
+								sctx.RoundTripper = upstreamRT
+							}
+							req, resp := proxy.filterRequest(req, sctx)
 							if resp == nil {
 								if !proxy.KeepHeader {
-									RemoveProxyHeaders(ctx, req)
+									RemoveProxyHeaders(sctx, req)
 								}
 								var err error
-								resp, err = ctx.RoundTrip(req)
+								resp, err = sctx.RoundTrip(req)
 								if err != nil {
-									ctx.Warnf("Cannot read response from mitm'd server %v", err)
+									sctx.Warnf("Cannot read response from mitm'd server %v", err)
 									http.Error(w, "502 Bad Gateway", http.StatusBadGateway)
 									return
 								}
-								ctx.Logf("resp %v", resp.Status)
+								sctx.Logf("resp %v", resp.Status)
 							}
-							resp = proxy.filterResponse(resp, ctx)
+							resp = proxy.filterResponse(resp, sctx)
 							defer resp.Body.Close()
 
 							copyHeaders(w.Header(), resp.Header, proxy.KeepDestinationHeaders)
@@ -370,6 +452,9 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 					Proxy:        proxy,
 					UserData:     ctx.UserData,
 					RoundTripper: ctx.RoundTripper,
+				}
+				if ctx.RoundTripper == nil && upstreamRT != nil {
+					ctx.RoundTripper = upstreamRT
 				}
 				if err != nil && !errors.Is(err, io.EOF) {
 					ctx.Warnf("Cannot read request from mitm'd client %v %v", r.Host, err)
