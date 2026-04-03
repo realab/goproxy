@@ -7,12 +7,13 @@ require (
 	github.com/elazarl/goproxy v1.5.0
 	github.com/elazarl/goproxy/ext v0.0.0-20250117123040-e9229c451ab8
 	github.com/inconshreveable/go-vhost v1.0.0
+	github.com/refraction-networking/utls v1.8.2
+	golang.org/x/mobile v0.0.0-20260312152759-81488f6aeb60
 )
 
 require (
 	github.com/andybalholm/brotli v1.0.6 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
-	github.com/refraction-networking/utls v1.8.2 // indirect
 	golang.org/x/crypto v0.49.0 // indirect
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
