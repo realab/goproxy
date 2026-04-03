@@ -1,12 +1,16 @@
 package goproxy
 
 import (
+	"context"
+	"crypto/tls"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"regexp"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // The basic proxy type. Implements http.Handler.
@@ -63,6 +67,17 @@ type ProxyHttpServer struct {
 	// Accept-Encoding header. To disable this behavior, set
 	// Tr.DisableCompression to true.
 	KeepAcceptEncoding bool
+	// UpstreamTLSClientHelloID, when set, causes the proxy to use utls
+	// (github.com/refraction-networking/utls) for all upstream TLS
+	// connections instead of the standard crypto/tls. This allows the
+	// proxy to mimic a specific browser's TLS fingerprint when
+	// connecting to upstream servers.
+	//
+	// Example:
+	//   proxy.UpstreamTLSClientHelloID = &utls.HelloChrome_Auto
+	//
+	// When nil (default), the standard crypto/tls library is used.
+	UpstreamTLSClientHelloID *utls.ClientHelloID
 }
 
 var hasPort = regexp.MustCompile(`:\d+$`)
@@ -165,4 +180,36 @@ func NewProxyHttpServer() *ProxyHttpServer {
 	}
 	proxy.ConnectDial = dialerFromEnv(&proxy)
 	return &proxy
+}
+
+// ConfigureTransport sets up the proxy's transport to use utls for upstream
+// TLS connections with the configured UpstreamTLSClientHelloID. Call this
+// after setting UpstreamTLSClientHelloID and (optionally) replacing Tr.
+//
+// It configures Tr.DialTLSContext to use utls instead of the standard
+// crypto/tls library. If Tr.DialTLSContext is already set, it is preserved
+// as the underlying TCP dialer.
+//
+// Example:
+//
+//	proxy := goproxy.NewProxyHttpServer()
+//	proxy.UpstreamTLSClientHelloID = &utls.HelloChrome_Auto
+//	proxy.ConfigureTransport()
+func (proxy *ProxyHttpServer) ConfigureTransport() {
+	if proxy.UpstreamTLSClientHelloID == nil || proxy.Tr == nil {
+		return
+	}
+	tlsCfg := proxy.Tr.TLSClientConfig
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{}
+	}
+	// Preserve existing DialTLSContext or DialContext as the TCP dialer.
+	var dialFn func(ctx context.Context, network, addr string) (net.Conn, error)
+	if proxy.Tr.DialTLSContext != nil {
+		// User already set a custom TLS dialer — it handles TCP+TLS,
+		// so we cannot layer utls on top. Respect the user's choice.
+		return
+	}
+	dialFn = proxy.Tr.DialContext // may be nil, utlsDialTLSContext handles that
+	proxy.Tr.DialTLSContext = utlsDialTLSContext(*proxy.UpstreamTLSClientHelloID, tlsCfg, dialFn)
 }

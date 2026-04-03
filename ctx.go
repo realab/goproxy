@@ -6,6 +6,8 @@ import (
 	"mime"
 	"net"
 	"net/http"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // ProxyCtx is the Proxy context, contains useful information about every request. It is passed to
@@ -25,9 +27,30 @@ type ProxyCtx struct {
 	// call of RespHandler
 	UserData any
 	// Will connect a request to a response
-	Session   int64
-	certStore CertStorage
-	Proxy     *ProxyHttpServer
+	Session int64
+	// TLSClientHello holds the parsed TLS ClientHello fingerprint from the
+	// client connection during MITM. It is nil for non-TLS or non-MITM requests.
+	TLSClientHello *TLSClientHelloInfo
+	certStore      CertStorage
+	Proxy          *ProxyHttpServer
+}
+
+// TLSClientHelloInfo contains the TLS ClientHello fingerprint captured during the
+// MITM TLS handshake. It stores both the raw record bytes and the parsed spec.
+type TLSClientHelloInfo struct {
+	// Raw is the full TLS record containing the ClientHello message,
+	// including the record header.
+	Raw []byte
+	// Parsed is the ClientHelloSpec parsed from the raw ClientHello by utls.
+	// It may be nil if parsing failed.
+	Parsed *utls.ClientHelloSpec
+	// JA3 is the JA3 fingerprint string in the format:
+	//   TLSVersion,CipherSuites,Extensions,EllipticCurves,ECPointFormats
+	// GREASE values are excluded. Empty if computation failed.
+	JA3 string
+	// JA3Hash is the MD5 hex digest of the JA3 string.
+	// Empty if computation failed.
+	JA3Hash string
 }
 
 type RoundTripper interface {

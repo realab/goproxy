@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/elazarl/goproxy"
+	utls "github.com/refraction-networking/utls"
 )
 
 func main() {
@@ -48,8 +49,18 @@ func main() {
 		ForceAttemptHTTP2: true,
 	}
 
+	// Use utls to mimic Chrome's TLS fingerprint for upstream connections.
+	proxy.UpstreamTLSClientHelloID = &utls.HelloChrome_Auto
+	proxy.ConfigureTransport()
+
 	// Log every request.
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		// Log client TLS fingerprint if available (MITM connections).
+		if hello := ctx.TLSClientHello; hello != nil && hello.JA3Hash != "" {
+			log.Printf("[%03d] TLS  JA3=%s JA3Hash=%s",
+				ctx.Session, hello.JA3, hello.JA3Hash)
+		}
+
 		dump, err := httputil.DumpRequest(req, false)
 		if err != nil {
 			log.Printf("[%03d] REQ  %-7s %s (dump error: %v)",

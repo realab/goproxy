@@ -15,6 +15,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"encoding/binary"
+
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 
 	"github.com/elazarl/goproxy/internal/http1parser"
@@ -33,43 +36,52 @@ const (
 // On success it returns the established TLS connection (kept open) and the
 // probe result. The caller is responsible for closing the returned connection.
 // On failure it returns (nil, probeUnreachable).
-func dialUpstreamTLS(dialCtx context.Context, host string, proxyTr *http.Transport) (net.Conn, probeResult) {
+func dialUpstreamTLS(dialCtx context.Context, host string, proxy *ProxyHttpServer) (net.Conn, probeResult) {
 	addr := host
 	if !strings.Contains(addr, ":") {
 		addr += ":443"
 	}
 
+	proxyTr := proxy.Tr
 	var d net.Dialer
 	if proxyTr != nil && proxyTr.DialContext != nil {
 		conn, err := proxyTr.DialContext(dialCtx, "tcp", addr)
 		if err != nil {
 			return nil, probeUnreachable
 		}
-		return doTLSHandshake(dialCtx, conn, host, proxyTr)
+		return doTLSHandshake(dialCtx, conn, host, proxy)
 	}
 	conn, err := d.DialContext(dialCtx, "tcp", addr)
 	if err != nil {
 		return nil, probeUnreachable
 	}
-	return doTLSHandshake(dialCtx, conn, host, proxyTr)
+	return doTLSHandshake(dialCtx, conn, host, proxy)
 }
 
-func doTLSHandshake(dialCtx context.Context, conn net.Conn, host string, proxyTr *http.Transport) (net.Conn, probeResult) {
+func doTLSHandshake(dialCtx context.Context, conn net.Conn, host string, proxy *ProxyHttpServer) (net.Conn, probeResult) {
 	tlsCfg := &tls.Config{
 		ServerName:         stripPort(host),
 		NextProtos:         []string{http2.NextProtoTLS, "http/1.1"},
 		InsecureSkipVerify: true,
 	}
-	if proxyTr != nil && proxyTr.TLSClientConfig != nil {
-		tlsCfg.InsecureSkipVerify = proxyTr.TLSClientConfig.InsecureSkipVerify
+	if proxy.Tr != nil && proxy.Tr.TLSClientConfig != nil {
+		tlsCfg.InsecureSkipVerify = proxy.Tr.TLSClientConfig.InsecureSkipVerify
 	}
 
-	tlsConn := tls.Client(conn, tlsCfg)
-	if err := tlsConn.HandshakeContext(dialCtx); err != nil {
+	var tlsConn net.Conn
+	var err error
+	if proxy.UpstreamTLSClientHelloID != nil {
+		tlsConn, err = utlsHandshake(dialCtx, conn, tlsCfg, *proxy.UpstreamTLSClientHelloID)
+	} else {
+		stdConn := tls.Client(conn, tlsCfg)
+		err = stdConn.HandshakeContext(dialCtx)
+		tlsConn = stdConn
+	}
+	if err != nil {
 		conn.Close()
 		return nil, probeUnreachable
 	}
-	if tlsConn.ConnectionState().NegotiatedProtocol == http2.NextProtoTLS {
+	if negotiatedProtocol(tlsConn) == http2.NextProtoTLS {
 		return tlsConn, probeH2
 	}
 	return tlsConn, probeH1Only
@@ -301,6 +313,11 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			peek, _ := readBuffer.Peek(1)
 			isTLS := len(peek) > 0 && peek[0] == _tlsRecordTypeHandshake
 
+			// If TLS, peek the full ClientHello record to fingerprint it.
+			if isTLS {
+				ctx.TLSClientHello = fingerprintClientHello(readBuffer, ctx)
+			}
+
 			var client net.Conn = &readBufferedConn{Conn: proxyClient, r: readBuffer}
 			defer func() {
 				_ = client.Close()
@@ -341,7 +358,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 						// Dial the upstream and perform TLS handshake to
 						// discover the negotiated protocol. The connection
 						// is kept open and reused for proxied requests.
-						upstreamConn, result := dialUpstreamTLS(sessionCtx, host, proxy.Tr)
+						upstreamConn, result := dialUpstreamTLS(sessionCtx, host, proxy)
 						switch result {
 						case probeH1Only:
 							offerH2 = false
@@ -355,6 +372,10 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 								connUsed.Do(func() { c = upstreamConn })
 								if c != nil {
 									return c, nil
+								}
+								if proxy.UpstreamTLSClientHelloID != nil {
+									dialFn := utlsDialTLSContext(*proxy.UpstreamTLSClientHelloID, tr.TLSClientConfig, nil)
+									return dialFn(tlsCtx, "tcp", host)
 								}
 								dialer := tls.Dialer{Config: tr.TLSClientConfig}
 								return dialer.DialContext(tlsCtx, "tcp", host)
@@ -414,11 +435,12 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 							}
 							req.RemoteAddr = r.RemoteAddr
 							sctx := &ProxyCtx{
-								Req:          req,
-								Session:      atomic.AddInt64(&proxy.sess, 1),
-								Proxy:        proxy,
-								UserData:     ctx.UserData,
-								RoundTripper: ctx.RoundTripper,
+								Req:            req,
+								Session:        atomic.AddInt64(&proxy.sess, 1),
+								Proxy:          proxy,
+								UserData:       ctx.UserData,
+								RoundTripper:   ctx.RoundTripper,
+								TLSClientHello: ctx.TLSClientHello,
 							}
 							if sctx.RoundTripper == nil && upstreamRT != nil {
 								sctx.RoundTripper = upstreamRT
@@ -466,11 +488,12 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			for !clientReader.IsEOF() {
 				req, err := clientReader.ReadRequest()
 				ctx := &ProxyCtx{
-					Req:          req,
-					Session:      atomic.AddInt64(&proxy.sess, 1),
-					Proxy:        proxy,
-					UserData:     ctx.UserData,
-					RoundTripper: ctx.RoundTripper,
+					Req:            req,
+					Session:        atomic.AddInt64(&proxy.sess, 1),
+					Proxy:          proxy,
+					UserData:       ctx.UserData,
+					RoundTripper:   ctx.RoundTripper,
+					TLSClientHello: ctx.TLSClientHello,
 				}
 				if ctx.RoundTripper == nil && upstreamRT != nil {
 					ctx.RoundTripper = upstreamRT
@@ -826,9 +849,61 @@ func (proxy *ProxyHttpServer) initializeTLSconnection(
 		tlsConfig = c
 	}
 
+	if proxy.UpstreamTLSClientHelloID != nil {
+		return utlsHandshake(ctx.Req.Context(), targetConn, tlsConfig, *proxy.UpstreamTLSClientHelloID)
+	}
+
 	tlsConn := tls.Client(targetConn, tlsConfig)
 	if err := tlsConn.HandshakeContext(ctx.Req.Context()); err != nil {
 		return nil, err
 	}
 	return tlsConn, nil
+}
+
+// _tlsRecordHeaderLen is the length of a TLS record header (type + version + length).
+const _tlsRecordHeaderLen = 5
+
+// fingerprintClientHello peeks the full TLS ClientHello record from the
+// buffered reader and parses it into a TLSClientHelloInfo using utls.
+// The peeked data remains in the buffer for the subsequent tls.Server handshake.
+func fingerprintClientHello(r *bufio.Reader, ctx *ProxyCtx) *TLSClientHelloInfo {
+	// Peek the TLS record header to learn the record length.
+	header, err := r.Peek(_tlsRecordHeaderLen)
+	if err != nil || len(header) < _tlsRecordHeaderLen {
+		ctx.Warnf("TLS fingerprint: cannot peek record header: %v", err)
+		return nil
+	}
+	recordLen := int(binary.BigEndian.Uint16(header[3:5]))
+	fullLen := _tlsRecordHeaderLen + recordLen
+
+	// Peek the entire TLS record (header + payload).
+	raw, err := r.Peek(fullLen)
+	if err != nil || len(raw) < fullLen {
+		ctx.Warnf("TLS fingerprint: cannot peek full ClientHello record (%d bytes): %v", fullLen, err)
+		return nil
+	}
+
+	// Make a copy so the fingerprint outlives the peek buffer.
+	rawCopy := make([]byte, len(raw))
+	copy(rawCopy, raw)
+
+	info := &TLSClientHelloInfo{Raw: rawCopy}
+
+	fp := &utls.Fingerprinter{AllowBluntMimicry: true}
+	spec, err := fp.FingerprintClientHello(rawCopy)
+	if err != nil {
+		ctx.Warnf("TLS fingerprint: cannot parse ClientHello: %v", err)
+	} else {
+		info.Parsed = spec
+	}
+
+	ja3Str, ja3Hash, err := computeJA3(rawCopy)
+	if err != nil {
+		ctx.Warnf("TLS fingerprint: cannot compute JA3: %v", err)
+	} else {
+		info.JA3 = ja3Str
+		info.JA3Hash = ja3Hash
+	}
+
+	return info
 }
