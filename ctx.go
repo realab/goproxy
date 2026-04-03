@@ -119,3 +119,16 @@ func (ctx *ProxyCtx) Charset() string {
 	}
 	return ""
 }
+
+// UserDataFrom retrieves the UserData from the context and asserts it to type T.
+// The second return value reports whether the assertion succeeded.
+// If ctx is nil, UserData is nil, or the type assertion fails, it returns the
+// zero value of T and false.
+func UserDataFrom[T any](ctx *ProxyCtx) (T, bool) {
+	var zero T
+	if ctx == nil {
+		return zero, false
+	}
+	v, ok := ctx.UserData.(T)
+	return v, ok
+}
