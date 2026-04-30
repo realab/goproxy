@@ -253,6 +253,7 @@ func TestMITMClientHTTP2Negotiation(t *testing.T) {
 		proxy := goproxy.NewProxyHttpServer()
 		proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 		proxy.AllowHTTP2 = true
+		proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 
 		proxySrv := httptest.NewServer(proxy)
 		defer proxySrv.Close()
@@ -291,6 +292,7 @@ func TestMITMClientHTTP2Negotiation(t *testing.T) {
 		proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 		proxy.AllowHTTP2 = true
 		proxy.MatchUpstreamH2 = true
+		proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 
 		proxySrv := httptest.NewServer(proxy)
 		defer proxySrv.Close()
@@ -330,6 +332,7 @@ func TestMITMClientHTTP2Negotiation(t *testing.T) {
 		proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 		proxy.AllowHTTP2 = true
 		proxy.MatchUpstreamH2 = true
+		proxy.Tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 
 		proxySrv := httptest.NewServer(proxy)
 		defer proxySrv.Close()
@@ -484,7 +487,7 @@ func TestMITMGRPCBidirectionalStream(t *testing.T) {
 		proxy.AllowHTTP2 = true
 		proxy.Tr = &http.Transport{
 			ForceAttemptHTTP2: true,
-			TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true},
 		}
 		proxySrv := httptest.NewServer(proxy)
 		defer proxySrv.Close()
